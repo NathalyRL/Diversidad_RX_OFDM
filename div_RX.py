@@ -8,7 +8,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 # ─────────────────────────────────────────────
-#  TABLAS LTE Y CONFIGURACIONES   (SIN CAMBIOS)
+#  TABLAS LTE Y CONFIGURACIONES
 # ─────────────────────────────────────────────
 BW_TABLE = {
     1.4: {"subcarriers_max": 93.3,  "useful_bw_mhz": 1.08, "data_subcarriers": 72,   "fft_size": 128},
@@ -26,8 +26,12 @@ CP_TYPES = {
 
 BITS_PER_SYMBOL = {"QPSK": 2, "16QAM": 4, "64QAM": 6}
 
-
-
+# ── Escenario fijo para la pestaña de Simulación Montecarlo ──
+# (no se piden en la interfaz; el escenario ya está definido)
+MC_ITERATIONS = 5
+MC_BW_MHZ = 15.0
+MC_CP_TYPE = "normal"
+MC_N_TAPS = 6
 
 def fft_idx_to_freq_khz(idx, fft_size):
     idx = np.asarray(idx)
@@ -60,7 +64,7 @@ def symbols_to_bits(symbols, constellation, bps):
     return bits_matrix.flatten()
 
 # ─────────────────────────────────────────────
-#  CANAL MULTIPATH PARA MÚLTIPLES ANTENAS (SIMO)   (SIN CAMBIOS)
+#  CANAL MULTIPATH PARA MÚLTIPLES ANTENAS (SIMO)
 # ─────────────────────────────────────────────
 def make_simo_channels(fft_size, n_rx, n_taps=6):
     H_channels = []
@@ -89,28 +93,9 @@ def apply_simo_channel(signal, h_channels, snr_db):
     return rx_signals
 
 # ─────────────────────────────────────────────
-#  OFDM CORE CON DIVERSIDAD Y MRC   (SIN CAMBIOS)
+#  OFDM CORE CON DIVERSIDAD Y MRC
 # ─────────────────────────────────────────────
 class SIMO_OFDMSystem:
-
-    def regenerate_channel(self):
-        """Genera canales nuevos para la diversidad en Montecarlo."""
-        self.H_real_channels, self.h_channels = make_simo_channels(
-            self.fft_size, self.n_rx, self.n_taps
-        )
-
-    def interleave(self, bits):
-        # Genera un patrón de permutación aleatorio para romper la correlación frecuencial
-        np.random.seed(42) 
-        indices = np.arange(len(bits))
-        np.random.shuffle(indices)
-        return bits[indices], indices
-
-    def deinterleave(self, bits, indices):
-        restored = np.zeros_like(bits)
-        restored[indices] = bits
-        return restored
-    
     def __init__(self, bw_mhz, mod, cp_type, n_rx=1, snr_db=20, n_taps=6, pilot_spacing=6):
         self.bw_mhz = bw_mhz
         self.mod = mod
@@ -145,6 +130,18 @@ class SIMO_OFDMSystem:
         self.n_pilots = len(self.pilot_sc)
         self.n_data_per_sym = len(self.data_sc)
 
+        # ── FIX: índices de orden ascendente en FRECUENCIA para poder
+        # interpolar correctamente con np.interp (que requiere xp creciente).
+        # Antes se interpolaba sobre el índice local, que tiene un salto
+        # de Nyquist (pasa de frecuencias positivas a negativas a mitad
+        # del arreglo), generando una estimación de canal incorrecta justo
+        # en ese salto -> ruido estructurado (líneas diagonales) en la imagen.
+        self._pilot_sort = np.argsort(self.pilot_freqs_khz)
+        self._data_sort = np.argsort(self.data_freqs_khz)
+        self._data_unsort = np.argsort(self._data_sort)
+        self._pilot_freqs_sorted = self.pilot_freqs_khz[self._pilot_sort]
+        self._data_freqs_sorted = self.data_freqs_khz[self._data_sort]
+
         self.H_real_channels, self.h_channels = make_simo_channels(self.fft_size, self.n_rx, self.n_taps)
 
     def modulate(self, data_symbols, pilot_value=1.0+0j):
@@ -167,10 +164,18 @@ class SIMO_OFDMSystem:
             pilots_rx = freq[self.pilot_sc]
             data_rx = freq[self.data_sc]
 
-            # Estimación por interpolación
+            # Estimación de canal en los pilotos
             H_pilots = pilots_rx / pilot_value
-            H_est_data = np.interp(self.data_idx_local, self.pilot_idx_local, H_pilots.real) + \
-                         1j * np.interp(self.data_idx_local, self.pilot_idx_local, H_pilots.imag)
+
+            # ── FIX: interpolar en frecuencia real y en orden ascendente,
+            # luego "desordenar" el resultado para que vuelva a alinearse
+            # con self.data_sc / self.data_freqs_khz en su orden original.
+            H_pilots_sorted = H_pilots[self._pilot_sort]
+
+            H_est_sorted = np.interp(self._data_freqs_sorted, self._pilot_freqs_sorted, H_pilots_sorted.real) + \
+                           1j * np.interp(self._data_freqs_sorted, self._pilot_freqs_sorted, H_pilots_sorted.imag)
+
+            H_est_data = H_est_sorted[self._data_unsort]
 
             data_rx_all.append(data_rx)
             H_est_data_all.append(H_est_data)
@@ -189,8 +194,7 @@ class SIMO_OFDMSystem:
         return eq_data, H_est_data_all
 
     def transmit_bits(self, bits):
-        bits_shuffled, indices = self.interleave(bits)
-        syms_data, pad = bits_to_symbols(bits_shuffled, self.constellation, self.bps)
+        syms_data, pad = bits_to_symbols(bits, self.constellation, self.bps)
         n_ofdm = int(np.ceil(len(syms_data) / self.n_data_per_sym))
 
         all_rx_bits = []
@@ -215,376 +219,112 @@ class SIMO_OFDMSystem:
             rx_syms_acc.append(eq_data)
 
         all_rx_bits = np.concatenate(all_rx_bits)
+        if pad > 0:
+            all_rx_bits = all_rx_bits[:-pad]
 
-        all_rx_bits = all_rx_bits[:len(bits)]
-        if pad > 0: all_rx_bits = all_rx_bits[:-pad]
-        
-        final_bits = self.deinterleave(all_rx_bits, indices)
-        
-        return final_bits, H_est_acc, tx_syms_acc, rx_syms_acc
-
+        return all_rx_bits, H_est_acc, tx_syms_acc, rx_syms_acc
 
 # ─────────────────────────────────────────────
-#  PALETA DE COLORES Y TIPOGRAFÍA DE LA INTERFAZ
-# ─────────────────────────────────────────────
-COLOR_BG_DARK     = "#16213e"
-COLOR_BG_DARKER   = "#0f1729"
-COLOR_BG_LIGHT    = "#eef1f7"
-COLOR_CARD        = "#ffffff"
-COLOR_BORDER      = "#dde3ee"
-COLOR_ACCENT      = "#3a86ff"
-COLOR_ACCENT_DARK = "#2667cc"
-COLOR_ACCENT_SOFT = "#e8f0fe"
-COLOR_SUCCESS     = "#27ae60"
-COLOR_DANGER      = "#e74c3c"
-COLOR_WARNING     = "#f39c12"
-COLOR_TEXT_DARK   = "#23272f"
-COLOR_TEXT_MUTED  = "#6c7689"
-COLOR_TEXT_LIGHT  = "#f5f7fa"
-FONT_FAMILY       = "Segoe UI"
-
-# Colores usados únicamente para el estilo de las gráficas matplotlib
-PLOT_PRIMARY   = COLOR_ACCENT
-PLOT_SECONDARY = "#ff6b35"
-PLOT_TERTIARY  = COLOR_SUCCESS
-PLOT_TEXT      = COLOR_TEXT_DARK
-PLOT_PANEL_BG  = COLOR_ACCENT_SOFT
-
-
-# ─────────────────────────────────────────────
-#  INTERFAZ GRÁFICA TKINTER  (REDISEÑADA)
+#  INTERFAZ GRÁFICA TKINTER
 # ─────────────────────────────────────────────
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Simulador OFDM · SIMO con MRC")
-        self.root.geometry("1280x830")
-        self.root.minsize(960, 600)
-        self.root.configure(bg=COLOR_BG_LIGHT)
+        self.root.title("Simulador Avanzado OFDM - SIMO con MRC (Corregido)")
+        self.root.geometry("1200x800")
 
         self.img_path = ""
-        self.img_preview = None
-
-        self._build_style()
-        self._build_header()
 
         # Notebook principal para las dos pestañas
-        self.notebook = ttk.Notebook(root, style="App.TNotebook")
-        self.notebook.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill='both', expand=True)
 
-        self.tab_main = ttk.Frame(self.notebook, style="Body.TFrame")
-        self.tab_montecarlo = ttk.Frame(self.notebook, style="Body.TFrame")
+        self.tab_main = ttk.Frame(self.notebook)
+        self.tab_montecarlo = ttk.Frame(self.notebook)
 
-        self.notebook.add(self.tab_main, text="  🖼️  Transmisión General / Imagen  ")
-        self.notebook.add(self.tab_montecarlo, text="  📊  Simulación Montecarlo  ")
+        self.notebook.add(self.tab_main, text="Transmisión General / Imagen")
+        self.notebook.add(self.tab_montecarlo, text="Simulación Montecarlo")
 
         self.setup_tab_main()
         self.setup_tab_montecarlo()
 
-        self._build_statusbar()
-
-    # ───────────────────────────────────────
-    #  ESTILO VISUAL GLOBAL
-    # ───────────────────────────────────────
-    def _build_style(self):
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use('clam')
-        except tk.TclError:
-            pass
-
-        style.configure(".", font=(FONT_FAMILY, 10), background=COLOR_BG_LIGHT)
-        style.configure("Body.TFrame", background=COLOR_BG_LIGHT)
-        style.configure("Sidebar.TFrame", background=COLOR_BG_LIGHT)
-
-        style.configure("Card.TFrame", background=COLOR_CARD, relief="solid",
-                         borderwidth=1, bordercolor=COLOR_BORDER)
-
-        style.configure("Card.TLabelframe", background=COLOR_CARD, relief="solid",
-                         borderwidth=1, bordercolor=COLOR_BORDER)
-        style.configure("Card.TLabelframe.Label", background=COLOR_CARD,
-                         foreground=COLOR_ACCENT_DARK, font=(FONT_FAMILY, 10, "bold"))
-
-        style.configure("TLabel", background=COLOR_CARD, foreground=COLOR_TEXT_DARK, font=(FONT_FAMILY, 10))
-        style.configure("Hint.TLabel", background=COLOR_CARD, foreground=COLOR_TEXT_MUTED, font=(FONT_FAMILY, 9))
-        style.configure("CardTitle.TLabel", background=COLOR_CARD, foreground=COLOR_TEXT_DARK,
-                         font=(FONT_FAMILY, 12, "bold"))
-
-        style.configure("TEntry", padding=6)
-        style.configure("TSpinbox", padding=6, arrowsize=14)
-        style.configure("TCombobox", padding=6)
-
-        style.configure("Accent.TButton", font=(FONT_FAMILY, 10, "bold"),
-                         background=COLOR_ACCENT, foreground="white", padding=10, borderwidth=0)
-        style.map("Accent.TButton",
-                  background=[("active", COLOR_ACCENT_DARK), ("disabled", "#a9b6c9")],
-                  foreground=[("disabled", "#eef1f7")])
-
-        style.configure("Secondary.TButton", font=(FONT_FAMILY, 9, "bold"),
-                         background=COLOR_BG_LIGHT, foreground=COLOR_ACCENT_DARK, padding=8, borderwidth=1)
-        style.map("Secondary.TButton", background=[("active", COLOR_ACCENT_SOFT)])
-
-        style.configure("App.TNotebook", background=COLOR_BG_LIGHT, borderwidth=0, tabmargins=[6, 6, 6, 0])
-        style.configure("App.TNotebook.Tab", background=COLOR_BG_LIGHT, foreground=COLOR_TEXT_MUTED,
-                         font=(FONT_FAMILY, 10, "bold"), padding=[14, 9], borderwidth=0)
-        style.map("App.TNotebook.Tab",
-                  background=[("selected", COLOR_CARD)],
-                  foreground=[("selected", COLOR_ACCENT_DARK)])
-
-        style.configure("Horizontal.TProgressbar", troughcolor=COLOR_BG_LIGHT,
-                         background=COLOR_ACCENT, borderwidth=0, thickness=14)
-
-    def _build_header(self):
-        header = tk.Frame(self.root, bg=COLOR_BG_DARK, height=72)
-        header.pack(fill='x', side='top')
-        header.pack_propagate(False)
-
-        icon_canvas = tk.Canvas(header, width=56, height=56, bg=COLOR_BG_DARK, highlightthickness=0)
-        icon_canvas.pack(side='left', padx=(22, 10), pady=8)
-        # Ícono estilizado: antena emitiendo señal
-        icon_canvas.create_oval(8, 38, 48, 50, fill=COLOR_ACCENT_DARK, outline="")
-        icon_canvas.create_line(28, 38, 28, 16, fill=COLOR_TEXT_LIGHT, width=3)
-        icon_canvas.create_oval(22, 8, 34, 20, fill=COLOR_ACCENT, outline="")
-        icon_canvas.create_arc(9, 1, 47, 39, start=25, extent=130, style="arc",
-                                outline=COLOR_ACCENT, width=2)
-        icon_canvas.create_arc(0, -8, 56, 48, start=25, extent=130, style="arc",
-                                outline="#5d6a85", width=2)
-
-        title_frame = tk.Frame(header, bg=COLOR_BG_DARK)
-        title_frame.pack(side='left', pady=10)
-        tk.Label(title_frame, text="Simulador OFDM", bg=COLOR_BG_DARK,
-                 fg=COLOR_TEXT_LIGHT, font=(FONT_FAMILY, 16, "bold")).pack(anchor='w')
-        tk.Label(title_frame, text="Diversidad SIMO  ·  Combinación de Máxima Razón (MRC)",
-                 bg=COLOR_BG_DARK, fg="#9aa7c2", font=(FONT_FAMILY, 9)).pack(anchor='w')
-
-    def _build_statusbar(self):
-        bar = tk.Frame(self.root, bg=COLOR_BG_DARKER, height=26)
-        bar.pack(fill='x', side='bottom')
-        bar.pack_propagate(False)
-        self.status_var = tk.StringVar(value="Listo")
-        tk.Label(bar, textvariable=self.status_var, bg=COLOR_BG_DARKER, fg="#9aa7c2",
-                 font=(FONT_FAMILY, 8), anchor='w').pack(side='left', padx=14)
-        tk.Label(bar, text="LTE OFDM · MRC Diversity Lab", bg=COLOR_BG_DARKER, fg="#5d6a85",
-                 font=(FONT_FAMILY, 8)).pack(side='right', padx=14)
-
-    # ───────────────────────────────────────
-    #  UTILIDAD: scroll con rueda del mouse (solo mientras el cursor
-    #  está sobre el panel correspondiente, para no interferir con
-    #  otros widgets desplazables de la ventana)
-    # ───────────────────────────────────────
-    def _enable_mousewheel(self, canvas):
-        def _on_wheel(event):
-            if getattr(event, "num", None) == 4:
-                canvas.yview_scroll(-2, "units")
-            elif getattr(event, "num", None) == 5:
-                canvas.yview_scroll(2, "units")
-            elif getattr(event, "delta", 0):
-                canvas.yview_scroll(int(-1 * (event.delta / 40)), "units")
-
-        def _activate(_event):
-            canvas.bind_all("<MouseWheel>", _on_wheel)
-            canvas.bind_all("<Button-4>", _on_wheel)
-            canvas.bind_all("<Button-5>", _on_wheel)
-
-        def _deactivate(_event):
-            canvas.unbind_all("<MouseWheel>")
-            canvas.unbind_all("<Button-4>")
-            canvas.unbind_all("<Button-5>")
-
-        canvas.bind("<Enter>", _activate)
-        canvas.bind("<Leave>", _deactivate)
-
-    # ───────────────────────────────────────
-    #  PESTAÑA 1: TRANSMISIÓN GENERAL / IMAGEN
-    # ───────────────────────────────────────
     def setup_tab_main(self):
-        self.tab_main.columnconfigure(0, weight=0)
-        self.tab_main.columnconfigure(1, weight=1)
-        self.tab_main.rowconfigure(0, weight=1)
+        # Panel de control izquierdo
+        ctrl_frame = ttk.LabelFrame(self.tab_main, text=" Parámetros del Sistema ", padding=10)
+        ctrl_frame.pack(side='left', fill='y', padx=10, pady=10)
 
-        # ── Barra lateral de parámetros ──
-        sidebar_outer = ttk.Frame(self.tab_main, style="Sidebar.TFrame")
-        sidebar_outer.grid(row=0, column=0, sticky='ns', padx=(14, 8), pady=14)
-        sidebar_outer.rowconfigure(0, weight=1)
-        sidebar_outer.columnconfigure(0, weight=1)
-
-        sidebar_canvas = tk.Canvas(sidebar_outer, bg=COLOR_BG_LIGHT, highlightthickness=0, width=272)
-        sidebar_scroll = ttk.Scrollbar(sidebar_outer, orient='vertical', command=sidebar_canvas.yview)
-        sidebar_canvas.configure(yscrollcommand=sidebar_scroll.set)
-        sidebar_canvas.grid(row=0, column=0, sticky='ns')
-        sidebar_scroll.grid(row=0, column=1, sticky='ns')
-
-        sidebar = ttk.Frame(sidebar_canvas, style="Sidebar.TFrame")
-        sidebar_window_id = sidebar_canvas.create_window((0, 0), window=sidebar, anchor='nw')
-
-        def _update_scrollregion(event=None):
-            sidebar_canvas.configure(scrollregion=sidebar_canvas.bbox('all'))
-        sidebar.bind('<Configure>', _update_scrollregion)
-
-        def _match_canvas_width(event):
-            sidebar_canvas.itemconfig(sidebar_window_id, width=event.width)
-        sidebar_canvas.bind('<Configure>', _match_canvas_width)
-
-        self._enable_mousewheel(sidebar_canvas)
-
-        card_ant = ttk.LabelFrame(sidebar, text="  📡  Antenas Receptoras  ",
-                                   style="Card.TLabelframe", padding=14)
-        card_ant.pack(fill='x', pady=(0, 12))
-        ttk.Label(card_ant, text="Número de antenas Rx:", style="TLabel").grid(
-            row=0, column=0, sticky='w', pady=4)
-        self.spin_rx = ttk.Spinbox(card_ant, from_=1, to=16, width=10)
+        ttk.Label(ctrl_frame, text="Antenas Receptoras (Rx):").grid(row=0, column=0, sticky='w', pady=4)
+        self.spin_rx = ttk.Spinbox(ctrl_frame, from_=1, to=16, width=12)
         self.spin_rx.set(2)
-        self.spin_rx.grid(row=0, column=1, pady=4, padx=(8, 0))
-        ttk.Label(card_ant, text="Más antenas → mayor ganancia de diversidad",
-                  style="Hint.TLabel", wraplength=220).grid(
-            row=1, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        self.spin_rx.grid(row=0, column=1, pady=4)
 
-        card_mod = ttk.LabelFrame(sidebar, text="  🎚️  Modulación y Canal  ",
-                                   style="Card.TLabelframe", padding=14)
-        card_mod.pack(fill='x', pady=(0, 12))
-
-        ttk.Label(card_mod, text="Modulación:", style="TLabel").grid(row=0, column=0, sticky='w', pady=4)
-        self.combo_mod = ttk.Combobox(card_mod, values=["QPSK", "16QAM", "64QAM"], state="readonly", width=11)
+        ttk.Label(ctrl_frame, text="Modulación:").grid(row=1, column=0, sticky='w', pady=4)
+        self.combo_mod = ttk.Combobox(ctrl_frame, values=["QPSK", "16QAM", "64QAM"], state="readonly", width=11)
         self.combo_mod.set("16QAM")
-        self.combo_mod.grid(row=0, column=1, pady=4, padx=(8, 0))
+        self.combo_mod.grid(row=1, column=1, pady=4)
 
-        ttk.Label(card_mod, text="Ancho de banda (MHz):", style="TLabel").grid(row=1, column=0, sticky='w', pady=4)
-        self.combo_bw = ttk.Combobox(card_mod, values=["1.4", "3.0", "5.0", "10.0", "15.0", "20.0"],
-                                      state="readonly", width=11)
+        ttk.Label(ctrl_frame, text="Ancho de Banda (MHz):").grid(row=2, column=0, sticky='w', pady=4)
+        self.combo_bw = ttk.Combobox(ctrl_frame, values=["1.4", "3.0", "5.0", "10.0", "15.0", "20.0"], state="readonly", width=11)
         self.combo_bw.set("5.0")
-        self.combo_bw.grid(row=1, column=1, pady=4, padx=(8, 0))
+        self.combo_bw.grid(row=2, column=1, pady=4)
 
-        ttk.Label(card_mod, text="Prefijo cíclico:", style="TLabel").grid(row=2, column=0, sticky='w', pady=4)
-        self.combo_cp = ttk.Combobox(card_mod, values=["normal", "extendido"], state="readonly", width=11)
+        ttk.Label(ctrl_frame, text="Prefijo Cíclico:").grid(row=3, column=0, sticky='w', pady=4)
+        self.combo_cp = ttk.Combobox(ctrl_frame, values=["normal", "extendido"], state="readonly", width=11)
         self.combo_cp.set("normal")
-        self.combo_cp.grid(row=2, column=1, pady=4, padx=(8, 0))
+        self.combo_cp.grid(row=3, column=1, pady=4)
 
-        ttk.Label(card_mod, text="Taps del canal:", style="TLabel").grid(row=3, column=0, sticky='w', pady=4)
-        self.spin_taps = ttk.Spinbox(card_mod, from_=1, to=20, width=10)
-        self.spin_taps.set(6)
-        self.spin_taps.grid(row=3, column=1, pady=4, padx=(8, 0))
-
-        card_snr = ttk.LabelFrame(sidebar, text="  ⚡  Condiciones de Prueba  ",
-                                   style="Card.TLabelframe", padding=14)
-        card_snr.pack(fill='x', pady=(0, 12))
-        ttk.Label(card_snr, text="SNR de prueba (dB):", style="TLabel").grid(row=0, column=0, sticky='w', pady=4)
-        self.entry_snr = ttk.Entry(card_snr, width=13)
+        ttk.Label(ctrl_frame, text="SNR de Prueba (dB):").grid(row=4, column=0, sticky='w', pady=4)
+        self.entry_snr = ttk.Entry(ctrl_frame, width=13)
         self.entry_snr.insert(0, "15")
-        self.entry_snr.grid(row=0, column=1, pady=4, padx=(8, 0))
+        self.entry_snr.grid(row=4, column=1, pady=4)
 
-        card_img = ttk.LabelFrame(sidebar, text="  🖼️  Imagen de Entrada  ",
-                                   style="Card.TLabelframe", padding=14)
-        card_img.pack(fill='x', pady=(0, 12))
-        ttk.Button(card_img, text="Seleccionar Imagen", style="Secondary.TButton",
-                   command=self.load_image).pack(fill='x', pady=(0, 8))
-        self.lbl_img = ttk.Label(card_img, text="Sin imagen cargada", style="Hint.TLabel",
-                                  foreground=COLOR_DANGER)
-        self.lbl_img.pack(anchor='w')
-        self.lbl_preview = tk.Label(card_img, bg=COLOR_CARD, text="(vista previa)",
-                                     fg=COLOR_TEXT_MUTED, font=(FONT_FAMILY, 8))
-        self.lbl_preview.pack(pady=(8, 0))
+        ttk.Label(ctrl_frame, text="Copias del Canal (Taps):").grid(row=5, column=0, sticky='w', pady=4)
+        self.spin_taps = ttk.Spinbox(ctrl_frame, from_=1, to=20, width=12)
+        self.spin_taps.set(6)
+        self.spin_taps.grid(row=5, column=1, pady=4)
 
-        ttk.Button(sidebar, text="▶  Simular Transmisión", style="Accent.TButton",
-                   command=self.run_main_simulation).pack(fill='x', pady=(4, 0))
+        ttk.Button(ctrl_frame, text="Seleccionar Imagen", command=self.load_image).grid(row=6, column=0, columnspan=2, pady=15, sticky='we')
+        self.lbl_img = ttk.Label(ctrl_frame, text="Sin imagen cargada", foreground="red")
+        self.lbl_img.grid(row=7, column=0, columnspan=2, pady=2)
 
-        # ── Panel de resultados ──
-        result_card = ttk.Frame(self.tab_main, style="Card.TFrame")
-        result_card.grid(row=0, column=1, sticky='nsew', padx=(8, 14), pady=14)
-        result_card.columnconfigure(0, weight=1)
-        result_card.rowconfigure(2, weight=1)
+        ttk.Button(ctrl_frame, text="Simular Transmisión", command=self.run_main_simulation).grid(row=8, column=0, columnspan=2, pady=15, sticky='we')
 
-        accent_bar = tk.Frame(result_card, bg=COLOR_ACCENT, height=4)
-        accent_bar.grid(row=0, column=0, sticky='ew')
+        # Área de Gráficas Derecha
+        self.plot_frame = ttk.Frame(self.tab_main)
+        self.plot_frame.pack(side='right', fill='both', expand=True, padx=10, pady=10)
 
-        header = ttk.Frame(result_card, style="Card.TFrame")
-        header.grid(row=1, column=0, sticky='ew', padx=18, pady=(14, 0))
-        ttk.Label(header, text="Resultados de la Simulación", style="CardTitle.TLabel").pack(anchor='w')
-
-        self.plot_frame = ttk.Frame(result_card, style="Card.TFrame")
-        self.plot_frame.grid(row=2, column=0, sticky='nsew', padx=18, pady=16)
-
-        self.placeholder_main = ttk.Label(
-            self.plot_frame,
-            text="👈  Configure los parámetros y presione\n“Simular Transmisión” para ver los resultados",
-            style="Hint.TLabel", justify='center', font=(FONT_FAMILY, 11)
-        )
-        self.placeholder_main.pack(expand=True)
-
-    # ───────────────────────────────────────
-    #  PESTAÑA 2: SIMULACIÓN MONTECARLO
-    # ───────────────────────────────────────
     def setup_tab_montecarlo(self):
-        self.tab_montecarlo.columnconfigure(0, weight=1)
-        self.tab_montecarlo.rowconfigure(1, weight=1)
+        m_frame = ttk.LabelFrame(self.tab_montecarlo, text=" Simulación Montecarlo (escenario predefinido) ", padding=10)
+        m_frame.pack(side='top', fill='x', padx=10, pady=10)
 
-        config_card = ttk.Frame(self.tab_montecarlo, style="Card.TFrame")
-        config_card.grid(row=0, column=0, sticky='ew', padx=14, pady=14)
-        config_card.columnconfigure(0, weight=1)
+        info_txt = (f"Escenario fijo: BW = {MC_BW_MHZ} MHz · CP = {MC_CP_TYPE} · Taps = {MC_N_TAPS} · "
+                     f"{MC_ITERATIONS} iteraciones por punto.\n"
+                     "Por cada punto (Modulación, Antenas Rx, SNR) se transmite y recibe la IMAGEN "
+                     "COMPLETA cargada en la pestaña 'Transmisión General / Imagen' "
+                     f"{MC_ITERATIONS} veces (canal aleatorio nuevo en cada repetición), acumulando "
+                     "errores de bit para calcular el BER de ese punto.")
+        ttk.Label(m_frame, text=info_txt, wraplength=950, foreground="#555555",
+                  font=("TkDefaultFont", 9)).grid(row=0, column=0, columnspan=2, padx=5, pady=(0,8), sticky='w')
 
-        accent_bar = tk.Frame(config_card, bg=COLOR_ACCENT, height=4)
-        accent_bar.pack(fill='x')
+        self.btn_run_montecarlo = ttk.Button(m_frame, text="Ejecutar Curvas BER de Montecarlo", command=self.run_montecarlo)
+        self.btn_run_montecarlo.grid(row=1, column=0, padx=5, pady=5, sticky='w')
 
-        inner = ttk.Frame(config_card, style="Card.TFrame", padding=16)
-        inner.pack(fill='x')
-        inner.columnconfigure(3, weight=1)
+        self.lbl_mc_status = ttk.Label(m_frame, text="", foreground="#0055ff", font=("TkDefaultFont", 9, "bold"))
+        self.lbl_mc_status.grid(row=2, column=0, columnspan=2, padx=5, pady=2, sticky='w')
 
-        ttk.Label(inner, text="Configuración de Simulación Estocástica", style="CardTitle.TLabel").grid(
-            row=0, column=0, columnspan=4, sticky='w', pady=(0, 4))
-        ttk.Label(inner, text="Calcula curvas de BER vs SNR para QPSK, 16QAM y 64QAM con 1, 3 y 8 antenas Rx.",
-                  style="Hint.TLabel").grid(row=1, column=0, columnspan=4, sticky='w', pady=(0, 12))
+        self.mc_progress = ttk.Progressbar(m_frame, orient='horizontal', mode='determinate', length=400)
+        self.mc_progress.grid(row=3, column=0, columnspan=2, padx=5, pady=(2,5), sticky='we')
 
-        ttk.Label(inner, text="Número de Iteraciones:", style="TLabel").grid(
-            row=2, column=0, sticky='w', padx=(0, 8))
-        self.entry_iter = ttk.Entry(inner, width=12)
-        self.entry_iter.insert(0, "100")
-        self.entry_iter.grid(row=2, column=1, sticky='w', padx=(0, 20))
+        self.mc_plot_frame = ttk.Frame(self.tab_montecarlo)
+        self.mc_plot_frame.pack(side='bottom', fill='both', expand=True, padx=10, pady=10)
 
-        self.btn_run_montecarlo = ttk.Button(inner, text="📈  Ejecutar Curvas BER de Montecarlo",
-                                              style="Accent.TButton", command=self.run_montecarlo)
-        self.btn_run_montecarlo.grid(row=2, column=2, padx=(0, 20))
 
-        self.mc_progress = ttk.Progressbar(inner, orient='horizontal', length=200, mode='determinate')
-        self.mc_progress.grid(row=2, column=3, sticky='ew')
-
-        self.mc_status_var = tk.StringVar(value="")
-        ttk.Label(inner, textvariable=self.mc_status_var, style="Hint.TLabel").grid(
-            row=3, column=0, columnspan=4, sticky='w', pady=(8, 0))
-
-        result_card = ttk.Frame(self.tab_montecarlo, style="Card.TFrame")
-        result_card.grid(row=1, column=0, sticky='nsew', padx=14, pady=(0, 14))
-        result_card.columnconfigure(0, weight=1)
-        result_card.rowconfigure(0, weight=1)
-
-        self.mc_plot_frame = ttk.Frame(result_card, style="Card.TFrame")
-        self.mc_plot_frame.grid(row=0, column=0, sticky='nsew', padx=18, pady=16)
-
-        self.placeholder_mc = ttk.Label(
-            self.mc_plot_frame,
-            text="📊  Presione “Ejecutar Curvas BER de Montecarlo”\npara generar el análisis estadístico",
-            style="Hint.TLabel", justify='center', font=(FONT_FAMILY, 11)
-        )
-        self.placeholder_mc.pack(expand=True)
-
-    # ───────────────────────────────────────
-    #  CARGA DE IMAGEN (con miniatura de vista previa)
-    # ───────────────────────────────────────
     def load_image(self):
         path = filedialog.askopenfilename(filetypes=[("Imágenes", "*.png *.jpg *.jpeg *.bmp")])
         if path:
             self.img_path = path
-            self.lbl_img.config(text=f"✅ {os.path.basename(path)}", foreground=COLOR_SUCCESS)
-            self.status_var.set(f"Imagen cargada: {os.path.basename(path)}")
-            try:
-                preview = Image.open(path).convert("RGB")
-                preview.thumbnail((140, 140))
-                self.img_preview = ImageTk.PhotoImage(preview)
-                self.lbl_preview.config(image=self.img_preview, text="")
-            except Exception:
-                pass
+            self.lbl_img.config(text=os.path.basename(path), foreground="green")
 
-    # ───────────────────────────────────────
-    #  SIMULACIÓN PRINCIPAL  (lógica original sin cambios)
-    # ───────────────────────────────────────
     def run_main_simulation(self):
         if not self.img_path:
             messagebox.showwarning("Advertencia", "Por favor seleccione una imagen base primero.")
@@ -600,9 +340,6 @@ class App:
         except ValueError:
             messagebox.showerror("Error", "Revise que los datos de entrada numéricos sean válidos.")
             return
-
-        self.status_var.set("Simulando transmisión OFDM...")
-        self.root.update_idletasks()
 
         # Procesar Imagen a bits
         img = Image.open(self.img_path).convert("RGB")
@@ -631,87 +368,83 @@ class App:
             widget.destroy()
 
         fig = plt.figure(figsize=(11, 7))
-        fig.patch.set_facecolor(COLOR_CARD)
-        gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.3)
+        fig.patch.set_facecolor("#f8f9fa")
+        gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.3)
 
         # 1. Canal Real vs Estimado (Se grafica la antena 1 de ejemplo)
         ax1 = fig.add_subplot(gs[0, :])
-        ax1.set_facecolor("#fbfcfe")
         data_freqs = ofdm.data_freqs_khz
         sort_idx = np.argsort(data_freqs)
 
         H_real_full = np.abs(ofdm.H_real_channels[0])
         H_est_mean = np.mean(np.abs(np.array(H_est_acc)), axis=0)[0]  # Antena 1
 
-        ax1.plot(data_freqs[sort_idx], H_real_full[ofdm.data_sc][sort_idx],
-                 label="Canal real |H_1(f)|", color=PLOT_PRIMARY, lw=1.8)
-        ax1.plot(data_freqs[sort_idx], H_est_mean[sort_idx],
-                 label="Est. MRC |Ĥ_1(f)|", color=PLOT_SECONDARY, ls="--", lw=1.4)
-        ax1.set_title(f"Canal en Frecuencia (Antena 1) con {taps} Taps", fontweight="bold",
-                      fontsize=10, color=PLOT_TEXT)
-        ax1.set_xlabel("Frecuencia (kHz)", fontsize=8, color=PLOT_TEXT)
-        ax1.grid(True, linestyle="--", alpha=0.4)
-        ax1.legend(fontsize=8, frameon=False)
-        for spine in ax1.spines.values():
-            spine.set_color(COLOR_BORDER)
+        ax1.plot(data_freqs[sort_idx], H_real_full[ofdm.data_sc][sort_idx], label="Canal real |H_1(f)|", color="#0055ff", lw=1.5)
+        ax1.plot(data_freqs[sort_idx], H_est_mean[sort_idx], label="Est. MRC |Ĥ_1(f)|", color="#ff5500", ls="--", lw=1.2)
+        ax1.set_title(f"Canal en Frecuencia (Antena 1) con {taps} Taps", fontweight="bold", fontsize=10)
+        ax1.grid(True, linestyle="--", alpha=0.5)
+        ax1.legend(fontsize=8)
 
         # 2. Imagen Original
         ax2 = fig.add_subplot(gs[1, 0])
         ax2.imshow(img)
-        ax2.set_title("Imagen Original", fontweight="bold", fontsize=10, color=PLOT_TEXT)
+        ax2.set_title("Imagen Original", fontweight="bold", fontsize=10)
         ax2.axis("off")
 
         # 3. Imagen Recibida
         ax3 = fig.add_subplot(gs[1, 1])
         ax3.imshow(img_recv)
-        ax3.set_title(f"Recibida (Rx Antenas: {n_rx})", fontweight="bold", fontsize=10, color=PLOT_TEXT)
+        ax3.set_title(f"Recibida (Rx Antenas: {n_rx})", fontweight="bold", fontsize=10)
         ax3.axis("off")
 
         # 4. Datos Estadísticos
         ax4 = fig.add_subplot(gs[1, 2])
         ax4.axis("off")
-        ax4.add_patch(plt.Rectangle((0.02, 0.02), 0.96, 0.96, transform=ax4.transAxes,
-                                     facecolor=PLOT_PANEL_BG, edgecolor=COLOR_BORDER, lw=1, zorder=0))
         stats = [
-            ("🔧", "Modulación", mod),
-            ("📶", "Ancho Banda", f"{bw} MHz"),
-            ("🧮", "FFT size", str(ofdm.fft_size)),
-            ("⚡", "SNR", f"{snr} dB"),
-            ("❌", "Errores bit", str(bit_errors)),
-            ("📉", "BER", f"{ber:.4e}"),
+            f"Modulación: {mod}",
+            f"Ancho Banda: {bw} MHz",
+            f"FFT size: {ofdm.fft_size}",
+            f"SNR: {snr} dB",
+            f"Errores bit: {bit_errors}",
+            f"BER: {ber:.4e}"
         ]
-        y_pos = 0.84
-        for icon, label, value in stats:
-            ax4.text(0.12, y_pos, f"{icon}  {label}", fontsize=9, fontweight="bold", color=PLOT_TEXT)
-            ax4.text(0.12, y_pos - 0.07, value, fontsize=10, color=COLOR_ACCENT_DARK, fontweight="bold")
-            y_pos -= 0.18
+        y_pos = 0.8
+        for text in stats:
+            ax4.text(0.1, y_pos, text, fontsize=10, fontweight="bold", color="#333333")
+            y_pos -= 0.15
 
         canvas = FigureCanvasTkAgg(fig, master=self.plot_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill='both', expand=True)
 
-        self.status_var.set(f"Simulación completada — BER = {ber:.4e}")
-
-    # ───────────────────────────────────────
-    #  SIMULACIÓN MONTECARLO  (lógica original sin cambios)
-    # ───────────────────────────────────────
     def run_montecarlo(self):
-        try:
-            iterations = int(self.entry_iter.get())
-        except ValueError:
-            messagebox.showerror("Error", "Coloque un número válido de iteraciones.")
+        # ── Validaciones de entrada ──
+        if not self.img_path:
+            messagebox.showwarning("Advertencia",
+                "Cargue una imagen en la pestaña 'Transmisión General / Imagen' antes de "
+                "ejecutar el Montecarlo (cada punto de la curva transmite esa imagen completa).")
             return
 
+        # Escenario fijo (no se pide en la interfaz de esta pestaña)
+        iterations = MC_ITERATIONS
+        bw = MC_BW_MHZ
+        cp = MC_CP_TYPE
+        taps = MC_N_TAPS
+
+        # ── Cargar la imagen UNA sola vez (los bits a transmitir son siempre los mismos) ──
+        img = Image.open(self.img_path).convert("RGB")
+        arr = np.array(img, dtype=np.uint8)
+        tx_bits_image = np.unpackbits(arr.flatten())
+        n_bits_image = len(tx_bits_image)
+
         self.btn_run_montecarlo.config(state="disabled")
-        self.root.update_idletasks()
 
         snr_axis = np.arange(0, 26, 5)
         antenas_test = [1, 3, 8]
         modulations = ["QPSK", "16QAM", "64QAM"]
 
-        total_steps = len(modulations) * len(antenas_test) * len(snr_axis)
-        self.mc_progress['maximum'] = total_steps
-        self.mc_progress['value'] = 0
+        total_steps = len(modulations) * len(antenas_test) * len(snr_axis) * iterations
+        self.mc_progress.config(maximum=total_steps, value=0)
         step_count = 0
 
         # Limpiar área de gráficas de montecarlo
@@ -719,15 +452,14 @@ class App:
             widget.destroy()
 
         fig, axes = plt.subplots(1, 3, figsize=(12, 5), sharey=True)
-        fig.patch.set_facecolor(COLOR_CARD)
+        fig.patch.set_facecolor("#f8f9fa")
 
-        colors_rx = {1: PLOT_PRIMARY, 3: PLOT_SECONDARY, 8: PLOT_TERTIARY}
-
-        # Loop Montecarlo simulando transmisiones de ráfagas aleatorias por cada configuración
+        # ── Loop Montecarlo: para cada punto (modulación, n_rx, SNR) se transmite
+        # y recibe la IMAGEN COMPLETA MC_ITERATIONS veces, regenerando un canal
+        # multipath aleatorio independiente en cada repetición, y acumulando los
+        # errores de bit de todas las repeticiones para obtener el BER de ese punto.
         for m_idx, mod in enumerate(modulations):
-            bps = BITS_PER_SYMBOL[mod]
             ax = axes[m_idx]
-            ax.set_facecolor("#fbfcfe")
 
             for n_rx in antenas_test:
                 ber_results = []
@@ -735,48 +467,49 @@ class App:
                     total_errors = 0
                     total_bits = 0
 
-                    # Generación dinámica del bloque estocástico
-                    ofdm_sim = SIMO_OFDMSystem(bw_mhz=5.0, mod=mod, cp_type="normal", n_rx=n_rx, snr_db=snr, n_taps=4)
-                    bits_per_iter = ofdm_sim.n_data_per_sym * bps
+                    for it in range(iterations):
+                        self.lbl_mc_status.config(
+                            text=f"Modulación {mod} | Antenas Rx {n_rx} | SNR {snr} dB | "
+                                 f"Iteración {it+1}/{iterations} (imagen completa)")
+                        self.mc_progress.config(value=step_count)
+                        self.root.update_idletasks()
 
-                    for _ in range(iterations):
-                        ofdm_sim.regenerate_channel()
-                        tx_bits = np.random.randint(0, 2, bits_per_iter)
-                        rx_bits, _, _, _ = ofdm_sim.transmit_bits(tx_bits)
+                        # Canal nuevo (aleatorio) en cada iteración -> promedio correcto
+                        # sobre realizaciones de desvanecimiento independientes.
+                        ofdm_sim = SIMO_OFDMSystem(bw_mhz=bw, mod=mod, cp_type=cp,
+                                                    n_rx=n_rx, snr_db=snr, n_taps=taps)
 
-                        min_l = min(len(tx_bits), len(rx_bits))
-                        total_errors += np.sum(tx_bits[:min_l] != rx_bits[:min_l])
-                        total_bits += len(tx_bits)
+                        rx_bits, _, _, _ = ofdm_sim.transmit_bits(tx_bits_image)
+
+                        min_l = min(n_bits_image, len(rx_bits))
+                        total_errors += int(np.sum(tx_bits_image[:min_l] != rx_bits[:min_l]))
+                        total_bits += min_l
+
+                        step_count += 1
 
                     ber_results.append(total_errors / total_bits if total_bits > 0 else 1)
 
-                    # ── Actualización visual de progreso (no afecta el cálculo) ──
-                    step_count += 1
-                    self.mc_progress['value'] = step_count
-                    self.mc_status_var.set(f"Calculando: {mod}, {n_rx} antenas Rx, SNR = {snr} dB...")
-                    self.root.update_idletasks()
+                ax.semilogy(snr_axis, ber_results, 'o-', label=f"{n_rx} Antenas Rx", lw=1.5)
 
-                ax.semilogy(snr_axis, ber_results, 'o-', color=colors_rx.get(n_rx, PLOT_PRIMARY),
-                            label=f"{n_rx} Antenas Rx", lw=1.8, markersize=5)
-
-            ax.set_title(f"Modulación {mod}", fontweight="bold", fontsize=10, color=PLOT_TEXT)
-            ax.set_xlabel("SNR (dB)", fontsize=9, color=PLOT_TEXT)
+            ax.set_title(f"Modulación {mod}", fontweight="bold", fontsize=10)
+            ax.set_xlabel("SNR (dB)")
             if m_idx == 0:
-                ax.set_ylabel("BER (Bit Error Rate)", fontsize=9, color=PLOT_TEXT)
-            ax.grid(True, which="both", linestyle="--", alpha=0.4)
-            ax.legend(fontsize=8, frameon=False)
+                ax.set_ylabel("BER (Bit Error Rate)")
+            ax.grid(True, which="both", linestyle="--", alpha=0.5)
+            ax.legend(fontsize=8)
             ax.set_ylim(1e-5, 1)
-            for spine in ax.spines.values():
-                spine.set_color(COLOR_BORDER)
 
-        fig.suptitle("Análisis Estadístico de Montecarlo usando Diversidad MRC",
-                      fontweight="bold", fontsize=12, color=PLOT_TEXT)
+        fig.suptitle(
+            f"Análisis Estadístico de Montecarlo usando Diversidad MRC\n"
+            f"(Imagen completa × {iterations} iteraciones por punto · BW={bw} MHz · CP={cp} · Taps={taps})",
+            fontweight="bold", fontsize=11)
 
         canvas = FigureCanvasTkAgg(fig, master=self.mc_plot_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill='both', expand=True)
 
-        self.mc_status_var.set(f"Simulación completada — {iterations} iteraciones por punto")
+        self.mc_progress.config(value=total_steps)
+        self.lbl_mc_status.config(text="Listo.")
         self.btn_run_montecarlo.config(state="normal")
 
 
