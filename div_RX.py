@@ -8,6 +8,7 @@ import gc
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import tkinter.font as tkfont
 
 # ─────────────────────────────────────────────
 #  TABLAS LTE Y CONFIGURACIONES
@@ -247,6 +248,27 @@ class App:
         self.root.title("Simulador OFDM - SIMO con MRC")
         self.root.geometry("1240x820")
 
+        # Ajuste global de fuente para mejorar legibilidad en la sección de configuraciones
+        default_font = tkfont.nametofont("TkDefaultFont")
+        # Aumentar tamaño aquí (ajusta el número según prefieras)
+        default_font.configure(size=11)
+
+        # Configurar estilos ttk para que usen la fuente aumentada
+        style = ttk.Style(self.root)
+        font_family = default_font.cget("family")
+        font_size = default_font.cget("size")
+        style.configure("TLabel", font=(font_family, font_size))
+        style.configure("TButton", font=(font_family, font_size))
+        style.configure("TEntry", font=(font_family, font_size))
+        style.configure("TCombobox", font=(font_family, font_size))
+        style.configure("TSpinbox", font=(font_family, font_size))
+        style.configure("TLabelframe.Label", font=(font_family, font_size + 1, "bold"))
+
+        # Guardar fuente y tupla para uso en otros métodos
+        self.font_family = font_family
+        self.font_size = font_size
+        self.ui_font = (font_family, font_size)
+
         self.running = True
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -274,27 +296,27 @@ class App:
         ctrl_frame.pack(side='left', fill='y', padx=10, pady=10)
 
         ttk.Label(ctrl_frame, text="Antenas Receptoras (Rx):").grid(row=0, column=0, sticky='w', pady=4)
-        self.spin_rx = ttk.Spinbox(ctrl_frame, from_=1, to=16, width=12)
+        self.spin_rx = ttk.Spinbox(ctrl_frame, from_=1, to=16, width=12, font=self.ui_font)
         self.spin_rx.set(2)
         self.spin_rx.grid(row=0, column=1, pady=4)
 
         ttk.Label(ctrl_frame, text="Modulación:").grid(row=1, column=0, sticky='w', pady=4)
-        self.combo_mod = ttk.Combobox(ctrl_frame, values=["QPSK", "16QAM", "64QAM"], state="readonly", width=11)
+        self.combo_mod = ttk.Combobox(ctrl_frame, values=["QPSK", "16QAM", "64QAM"], state="readonly", width=11, font=self.ui_font)
         self.combo_mod.set("16QAM")
         self.combo_mod.grid(row=1, column=1, pady=4)
 
         ttk.Label(ctrl_frame, text="Ancho de Banda (MHz):").grid(row=2, column=0, sticky='w', pady=4)
-        self.combo_bw = ttk.Combobox(ctrl_frame, values=["1.4", "3.0", "5.0", "10.0", "15.0", "20.0"], state="readonly", width=11)
+        self.combo_bw = ttk.Combobox(ctrl_frame, values=["1.4", "3.0", "5.0", "10.0", "15.0", "20.0"], state="readonly", width=11, font=self.ui_font)
         self.combo_bw.set("5.0")
         self.combo_bw.grid(row=2, column=1, pady=4)
 
         ttk.Label(ctrl_frame, text="Prefijo Cíclico:").grid(row=3, column=0, sticky='w', pady=4)
-        self.combo_cp = ttk.Combobox(ctrl_frame, values=["normal", "extendido"], state="readonly", width=11)
+        self.combo_cp = ttk.Combobox(ctrl_frame, values=["normal", "extendido"], state="readonly", width=11, font=self.ui_font)
         self.combo_cp.set("normal")
         self.combo_cp.grid(row=3, column=1, pady=4)
 
         ttk.Label(ctrl_frame, text="SNR de Prueba (dB):").grid(row=4, column=0, sticky='w', pady=4)
-        self.entry_snr = ttk.Entry(ctrl_frame, width=13)
+        self.entry_snr = ttk.Entry(ctrl_frame, width=13, font=self.ui_font)
         self.entry_snr.insert(0, "10.0")
         self.entry_snr.grid(row=4, column=1, pady=4)
 
@@ -303,11 +325,11 @@ class App:
         # self.spin_taps.set(6)
         # self.spin_taps.grid(row=5, column=1, pady=4)
 
-        ttk.Button(ctrl_frame, text="Seleccionar Imagen", command=self.load_image).grid(row=6, column=0, columnspan=2, pady=15, sticky='we')
+        ttk.Button(ctrl_frame, text="Seleccionar Imagen", command=self.load_image, style=None).grid(row=6, column=0, columnspan=2, pady=15, sticky='we')
         self.lbl_img = ttk.Label(ctrl_frame, text="Sin imagen cargada", foreground="red")
         self.lbl_img.grid(row=7, column=0, columnspan=2, pady=2)
 
-        ttk.Button(ctrl_frame, text="Simular Transmisión", command=self.run_main_simulation).grid(row=8, column=0, columnspan=2, pady=15, sticky='we')
+        ttk.Button(ctrl_frame, text="Simular Transmisión", command=self.run_main_simulation, style=None).grid(row=8, column=0, columnspan=2, pady=15, sticky='we')
 
         self.plot_frame = ttk.Frame(self.tab_main)
         self.plot_frame.pack(side='right', fill='both', expand=True, padx=10, pady=10)
@@ -317,10 +339,10 @@ class App:
         m_frame.pack(side='top', fill='x', padx=10, pady=10)
 
         info_txt = (f"Escenario fijo: BW = {MC_BW_MHZ} MHz · CP = {MC_CP_TYPE}  "
-                    f"{MC_ITERATIONS} iteraciones por punto.\n"
-                    "Cada modulación ajustará automáticamente los límites de su eje Y para visualizar adecuadamente caídas bajas de BER.")
+                f"{MC_ITERATIONS} iteraciones por punto.\n"
+                "Cada modulación ajustará automáticamente los límites de su eje Y para visualizar adecuadamente caídas bajas de BER.")
         ttk.Label(m_frame, text=info_txt, wraplength=1100, foreground="#555555",
-                  font=("TkDefaultFont", 9)).grid(row=0, column=0, columnspan=3, padx=5, pady=(0,8), sticky='w')
+              font=(self.font_family, self.font_size + 0)).grid(row=0, column=0, columnspan=3, padx=5, pady=(0,8), sticky='w')
 
         self.btn_mc_qpsk = ttk.Button(m_frame, text="Ejecutar QPSK", command=lambda: self.run_select_montecarlo("QPSK"))
         self.btn_mc_qpsk.grid(row=1, column=0, padx=5, pady=5, sticky='we')
@@ -349,14 +371,14 @@ class App:
         for idx, ax in enumerate(self.axes_mc):
             ax.clear()
             ax.set_facecolor("#fbfcfe")
-            ax.set_title(f"Modulación {modulations[idx]}", fontweight="bold", fontsize=10)
-            ax.set_xlabel("SNR (dB)", fontsize=8)
-            ax.set_ylabel("BER (Bit Error Rate)", fontsize=8)
+            ax.set_title(f"Modulación {modulations[idx]}", fontweight="bold", fontsize=(self.font_size + 2))
+            ax.set_xlabel("SNR (dB)", fontsize=(self.font_size))
+            ax.set_ylabel("BER (Bit Error Rate)", fontsize=(self.font_size))
             ax.grid(True, which="both", linestyle="--", alpha=0.5)
             ax.set_yscale('log')
             ax.set_ylim(1e-5, 1.2)  # Límites base por defecto
             ax.set_xlim(0, 25)
-        self.fig_mc.suptitle("Análisis Montecarlo", fontweight="bold", fontsize=12)
+        self.fig_mc.suptitle("Análisis Montecarlo", fontweight="bold", fontsize=(self.font_size + 4))
         self.canvas_mc.draw()
 
     def load_image(self):
@@ -416,18 +438,18 @@ class App:
 
         ax1.plot(data_freqs[sort_idx], H_real_full[ofdm.data_sc][sort_idx], label="Canal real |H_1(f)|", color="#0055ff", lw=1.5)
         ax1.plot(data_freqs[sort_idx], H_est_mean[sort_idx], label="Est. MRC |Ĥ_1(f)|", color="#ff5500", ls="--", lw=1.2)
-        ax1.set_title(f"Canal en Frecuencia (Antena 1) ", fontweight="bold", fontsize=10)
+        ax1.set_title(f"Canal en Frecuencia (Antena 1) ", fontweight="bold", fontsize=(self.font_size + 2))
         ax1.grid(True, linestyle="--", alpha=0.5)
-        ax1.legend(fontsize=8)
+        ax1.legend(fontsize=self.font_size)
 
         ax2 = fig.add_subplot(gs[1, 0])
         ax2.imshow(img)
-        ax2.set_title("Imagen Original", fontweight="bold", fontsize=10)
+        ax2.set_title("Imagen Original", fontweight="bold", fontsize=(self.font_size + 2))
         ax2.axis("off")
 
         ax3 = fig.add_subplot(gs[1, 1])
         ax3.imshow(img_recv)
-        ax3.set_title(f"Recibida (Rx Antenas: {n_rx})", fontweight="bold", fontsize=10)
+        ax3.set_title(f"Recibida (Rx Antenas: {n_rx})", fontweight="bold", fontsize=(self.font_size + 2))
         ax3.axis("off")
 
         ax4 = fig.add_subplot(gs[1, 2])
@@ -442,7 +464,7 @@ class App:
         ]
         y_pos = 0.8
         for text in stats:
-            ax4.text(0.1, y_pos, text, fontsize=10, fontweight="bold", color="#333333")
+            ax4.text(0.1, y_pos, text, fontsize=(self.font_size + 2), fontweight="bold", color="#333333")
             y_pos -= 0.15
 
         canvas = FigureCanvasTkAgg(fig, master=self.plot_frame)
@@ -528,9 +550,9 @@ class App:
             if len(self.mc_history[mod_name]) > 0:
                 ax.clear() # Limpiamos de verdad el eje anterior
                 ax.set_facecolor("#fbfcfe")
-                ax.set_title(f"Modulación {mod_name}", fontweight="bold", fontsize=10)
-                ax.set_xlabel("SNR (dB)", fontsize=8)
-                ax.set_ylabel("BER (Bit Error Rate)", fontsize=8)
+                ax.set_title(f"Modulación {mod_name}", fontweight="bold", fontsize=(self.font_size + 2))
+                ax.set_xlabel("SNR (dB)", fontsize=(self.font_size))
+                ax.set_ylabel("BER (Bit Error Rate)", fontsize=(self.font_size))
                 ax.grid(True, which="both", linestyle="--", alpha=0.5)
                 ax.set_yscale('log')
                 ax.set_xlim(0, 25)
@@ -549,7 +571,7 @@ class App:
                 else:
                     ax.set_ylim(1e-5, 1.2)
 
-                ax.legend(fontsize=8, loc="upper right")
+                ax.legend(fontsize=self.font_size, loc="upper right")
 
         # Forzar el refresco estricto del canvas en la UI
         self.fig_mc.canvas.draw_idle() 
