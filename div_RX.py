@@ -31,7 +31,6 @@ BITS_PER_SYMBOL = {"QPSK": 2, "16QAM": 4, "64QAM": 6}
 MC_ITERATIONS = 3
 MC_BW_MHZ = 20.0
 MC_CP_TYPE = "normal"
-MC_N_TAPS = 6
 
 def fft_idx_to_freq_khz(idx, fft_size):
     idx = np.asarray(idx)
@@ -69,7 +68,7 @@ def symbols_to_bits(symbols, constellation, bps):
 ITU_DELAYS_US = np.array([0, 0.11, 0.19, 0.41])
 ITU_POWERS_DB = np.array([0, -0.9, -19.2, -22.8])
 
-def make_simo_channels(fft_size, n_rx, n_taps=6):
+def make_simo_channels(fft_size, n_rx):
     H_channels = []
     h_channels = []
 
@@ -100,13 +99,12 @@ def make_simo_channels(fft_size, n_rx, n_taps=6):
 #  OFDM CORE CON DIVERSIDAD Y MRC
 # ─────────────────────────────────────────────
 class SIMO_OFDMSystem:
-    def __init__(self, bw_mhz, mod, cp_type, n_rx=1, snr_db=20, n_taps=6, pilot_spacing=6):
+    def __init__(self, bw_mhz, mod, cp_type, n_rx=1, snr_db=20, pilot_spacing=6):
         self.bw_mhz = bw_mhz
         self.mod = mod
         self.cp_type = cp_type
         self.n_rx = n_rx
         self.snr_db = snr_db
-        self.n_taps = n_taps
         self.pilot_spacing = pilot_spacing
 
         info = BW_TABLE[bw_mhz]
@@ -140,7 +138,7 @@ class SIMO_OFDMSystem:
         self._pilot_freqs_sorted = self.pilot_freqs_khz[self._pilot_sort]
         self._data_freqs_sorted = self.data_freqs_khz[self._data_sort]
 
-        self.H_real_channels, self.h_channels = make_simo_channels(self.fft_size, self.n_rx, self.n_taps)
+        self.H_real_channels, self.h_channels = make_simo_channels(self.fft_size, self.n_rx)
 
     def modulate_batch(self, data_syms_batch, pilot_value=1.0+0j):
         n_sym = data_syms_batch.shape[0]
@@ -300,10 +298,10 @@ class App:
         self.entry_snr.insert(0, "10.0")
         self.entry_snr.grid(row=4, column=1, pady=4)
 
-        ttk.Label(ctrl_frame, text="Copias del Canal (Taps):").grid(row=5, column=0, sticky='w', pady=4)
-        self.spin_taps = ttk.Spinbox(ctrl_frame, from_=1, to=20, width=12)
-        self.spin_taps.set(6)
-        self.spin_taps.grid(row=5, column=1, pady=4)
+        # ttk.Label(ctrl_frame, text="Copias del Canal (Taps):").grid(row=5, column=0, sticky='w', pady=4)
+        # self.spin_taps = ttk.Spinbox(ctrl_frame, from_=1, to=20, width=12)
+        # self.spin_taps.set(6)
+        # self.spin_taps.grid(row=5, column=1, pady=4)
 
         ttk.Button(ctrl_frame, text="Seleccionar Imagen", command=self.load_image).grid(row=6, column=0, columnspan=2, pady=15, sticky='we')
         self.lbl_img = ttk.Label(ctrl_frame, text="Sin imagen cargada", foreground="red")
@@ -318,7 +316,7 @@ class App:
         m_frame = ttk.LabelFrame(self.tab_montecarlo, text=" Ejecución Modular por Esquema ", padding=10)
         m_frame.pack(side='top', fill='x', padx=10, pady=10)
 
-        info_txt = (f"Escenario fijo: BW = {MC_BW_MHZ} MHz · CP = {MC_CP_TYPE} · Taps = {MC_N_TAPS} · "
+        info_txt = (f"Escenario fijo: BW = {MC_BW_MHZ} MHz · CP = {MC_CP_TYPE}  "
                     f"{MC_ITERATIONS} iteraciones por punto.\n"
                     "Cada modulación ajustará automáticamente los límites de su eje Y para visualizar adecuadamente caídas bajas de BER.")
         ttk.Label(m_frame, text=info_txt, wraplength=1100, foreground="#555555",
@@ -378,7 +376,7 @@ class App:
             bw = float(self.combo_bw.get())
             cp = self.combo_cp.get()
             snr = float(self.entry_snr.get())
-            taps = int(self.spin_taps.get())
+            
         except ValueError:
             messagebox.showerror("Error", "Revise que los datos de entrada numéricos sean válidos.")
             return
@@ -388,7 +386,7 @@ class App:
         shape = arr.shape
         bits = np.unpackbits(arr.flatten())
 
-        ofdm = SIMO_OFDMSystem(bw_mhz=bw, mod=mod, cp_type=cp, n_rx=n_rx, snr_db=snr, n_taps=taps)
+        ofdm = SIMO_OFDMSystem(bw_mhz=bw, mod=mod, cp_type=cp, n_rx=n_rx, snr_db=snr)
         rx_bits, H_est_acc, tx_syms_acc, rx_syms_acc = ofdm.transmit_bits(bits)
 
         min_len = min(len(bits), len(rx_bits))
@@ -418,7 +416,7 @@ class App:
 
         ax1.plot(data_freqs[sort_idx], H_real_full[ofdm.data_sc][sort_idx], label="Canal real |H_1(f)|", color="#0055ff", lw=1.5)
         ax1.plot(data_freqs[sort_idx], H_est_mean[sort_idx], label="Est. MRC |Ĥ_1(f)|", color="#ff5500", ls="--", lw=1.2)
-        ax1.set_title(f"Canal en Frecuencia (Antena 1) con {taps} Taps", fontweight="bold", fontsize=10)
+        ax1.set_title(f"Canal en Frecuencia (Antena 1) ", fontweight="bold", fontsize=10)
         ax1.grid(True, linestyle="--", alpha=0.5)
         ax1.legend(fontsize=8)
 
@@ -464,14 +462,14 @@ class App:
         iterations = MC_ITERATIONS
         bw = MC_BW_MHZ
         cp = MC_CP_TYPE
-        taps = MC_N_TAPS
+        #taps = MC_N_TAPS
 
         img = Image.open(self.img_path).convert("RGB")
         arr = np.array(img, dtype=np.uint8)
         tx_bits_image = np.unpackbits(arr.flatten())
         n_bits_image = len(tx_bits_image)
 
-        snr_axis = np.arange(0, 26, 5)
+        snr_axis = np.arange(0, 26, 2.5)
         antenas_test = [1, 4, 8]
         modulations = ["QPSK", "16QAM", "64QAM"]
 
@@ -489,7 +487,7 @@ class App:
 
             for it in range(iterations):
                 if not self.running: break # <-- Interrumpir si se cerró la ventana
-                ofdm_sim = SIMO_OFDMSystem(bw_mhz=bw, mod=target_mod, cp_type=cp, n_rx=n_rx, snr_db=0, n_taps=taps)
+                ofdm_sim = SIMO_OFDMSystem(bw_mhz=bw, mod=target_mod, cp_type=cp, n_rx=n_rx, snr_db=0)
 
                 for snr_idx, snr in enumerate(snr_axis):
                     if not self.running: break # <-- Interrumpir si se cerró la ventana
